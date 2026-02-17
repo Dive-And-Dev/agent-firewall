@@ -1,0 +1,33 @@
+version: '3.9'
+
+services:
+  agent-firewall:
+    build: .
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      AF_PORT: "8787"
+      AF_BIND: "0.0.0.0"
+      AF_BRIDGE_TOKEN: "${AF_BRIDGE_TOKEN}"
+      AF_ALLOWED_ROOTS: "${AF_ALLOWED_ROOTS:-/workspace}"
+      AF_DENY_GLOBS: "${AF_DENY_GLOBS:-**/.env,**/.ssh/**,**/credentials*,**/*.pem,**/*.key}"
+      AF_DATA_DIR: "/data/sessions"
+      AF_MAX_CONCURRENT: "1"
+      AF_PROMPT_APPEND: "${AF_PROMPT_APPEND:-}"
+    volumes:
+      - session-data:/data/sessions
+      # Mount only the specific workspace(s) the agent needs — not /home or /
+      # Example: - /Users/chris/Projects/myapp:/workspace:ro
+    networks:
+      - agent-net
+    restart: unless-stopped
+
+volumes:
+  session-data:
+
+networks:
+  agent-net:
+    driver: bridge
+    # Agents on this network cannot reach the host network.
+    # If agents need internet access for specific tools, add explicit
+    # egress rules in a firewall or use a proxy container.
