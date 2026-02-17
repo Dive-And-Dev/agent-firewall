@@ -165,7 +165,11 @@ export class FileSessionStore {
     }
   }
 
-  async getArtifactPath(sessionId: string, artifactName: string): Promise<string | null> {
+  async getArtifactPath(
+    sessionId: string,
+    artifactName: string,
+    workspaceRoot?: string,
+  ): Promise<string | null> {
     validateSessionId(sessionId);
     // Prevent path traversal and directory access in artifact names
     if (!artifactName || artifactName === '.' || artifactName === '..' || artifactName.includes('/') || artifactName.includes('\\')) {
@@ -176,7 +180,11 @@ export class FileSessionStore {
       return null;
     }
 
-    const artifactsDir = path.join(this.baseDir, sessionId, 'artifacts');
+    // Artifacts live in workspace/.agent-firewall/artifacts/ when workspaceRoot is provided.
+    // Fall back to session data dir for backwards-compat / tests.
+    const artifactsDir = workspaceRoot
+      ? path.join(workspaceRoot, '.agent-firewall', 'artifacts')
+      : path.join(this.baseDir, sessionId, 'artifacts');
     const artifactPath = path.join(artifactsDir, safe);
     try {
       // Resolve symlinks and verify the real path is still under artifacts dir
