@@ -26,6 +26,8 @@ class StubWorker implements Worker {
     _goal: string,
     prompt: string,
     _workspaceRoot: string,
+    _sessionDir: string,
+    _allowedTools: string[],
     _timeoutMs: number,
     onProgress: (patch: Partial<SharedState>) => Promise<void>,
   ): Promise<WorkerResult> {
@@ -37,9 +39,12 @@ class StubWorker implements Worker {
       redacted_output: 'redacted output',
       exit_code: 0,
       timed_out: false,
+      turns_completed: 1,
+      cost_usd: null,
       blockers: [],
       files_changed: ['src/index.ts'],
       artifacts: [],
+      fallback_events: [],
       ...this.result,
     };
   }
@@ -58,6 +63,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     turnsMaxCap: 50,
     timeoutSecondsCap: 1800,
     promptAppendMaxBytes: 2048,
+    logtailMaxLines: 200,
     ...overrides,
   };
 }
@@ -93,7 +99,6 @@ describe('routes', () => {
   // --- POST /v1/tasks ---
 
   it('POST /v1/tasks returns 202 with session_id', async () => {
-    // Create workspace dir so pathGuard resolves it
     const workspace = path.join(tmpDir, 'project');
     fs.mkdirSync(workspace, { recursive: true });
     config.allowedRoots = [tmpDir];
@@ -108,7 +113,6 @@ describe('routes', () => {
     expect(res.body.session_id).toBeTruthy();
     expect(typeof res.body.session_id).toBe('string');
 
-    // Wait for background worker to complete before cleanup (deterministic)
     await worker.done;
   });
 
@@ -138,22 +142,21 @@ describe('routes', () => {
     fs.mkdirSync(workspace, { recursive: true });
     config.allowedRoots = [tmpDir];
 
-    // Use a worker that blocks until we release it
     let releaseWorker: () => void;
     const workerBlockedP = new Promise<void>(r => { releaseWorker = r; });
 
     const hangingWorker: Worker = {
-      async run(_sid, _goal, _prompt, _ws, _timeout, _onProgress) {
+      async run(_sid, _goal, _prompt, _ws, _sessionDir, _allowedTools, _timeout, _onProgress) {
         await workerBlockedP;
         return {
           raw_output: '', redacted_output: '', exit_code: 0,
-          timed_out: false, blockers: [], files_changed: [], artifacts: [],
+          timed_out: false, turns_completed: 0, cost_usd: null,
+          blockers: [], files_changed: [], artifacts: [], fallback_events: [],
         };
       },
     };
     const hangApp = createApp(config, hangingWorker);
 
-    // First request takes the slot — returns 202 immediately
     const res1 = await request(hangApp)
       .post('/v1/tasks')
       .set('Authorization', AUTH)
@@ -161,8 +164,6 @@ describe('routes', () => {
 
     expect(res1.status).toBe(202);
 
-    // The worker is now running in the background, gate is acquired.
-    // Second request should be rejected.
     const res2 = await request(hangApp)
       .post('/v1/tasks')
       .set('Authorization', AUTH)
@@ -170,9 +171,7 @@ describe('routes', () => {
 
     expect(res2.status).toBe(503);
 
-    // Clean up: release the hanging worker
     releaseWorker!();
-    // Small yield to let the worker's finally block complete
     await new Promise(r => setTimeout(r, 20));
   });
 
@@ -185,13 +184,11 @@ describe('routes', () => {
 
     const appInstance = app();
 
-    // Create a session first
     await request(appInstance)
       .post('/v1/tasks')
       .set('Authorization', AUTH)
       .send({ goal: 'Test', workspace_root: workspace });
 
-    // Wait for worker to complete (deterministic)
     await worker.done;
 
     const res = await request(appInstance)
@@ -227,7 +224,6 @@ describe('routes', () => {
 
     const sessionId = createRes.body.session_id;
 
-    // Wait for worker to complete (deterministic)
     await worker.done;
 
     const res = await request(appInstance)
@@ -237,6 +233,8 @@ describe('routes', () => {
     expect(res.status).toBe(200);
     expect(res.body.session_id).toBe(sessionId);
     expect(res.body.goal).toBe('Test state');
+    // artifacts is now ArtifactEntry[] not string[]
+    expect(Array.isArray(res.body.artifacts)).toBe(true);
   });
 
   // --- POST /v1/sessions/:id/abort ---
@@ -257,8 +255,62 @@ describe('routes', () => {
       .query({ path: '/etc/passwd' })
       .set('Authorization', AUTH);
 
-    // Session doesn't exist
     expect(res.status).toBe(404);
+  });
+
+  it('GET /v1/sessions/:id/excerpt supports start/end aliases', async () => {
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    const testFile = path.join(workspace, 'test.txt');
+    fs.writeFileSync(testFile, 'line1\nline2\nline3\nline4\nline5\n');
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    // Use start/end aliases (spec-compatible)
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/excerpt`)
+      .query({ path: 'test.txt', start: 2, end: 3 })
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(200);
+    expect(res.body.content).toBe('line2\nline3');
+    expect(res.body.line_start).toBe(2);
+    expect(res.body.line_end).toBe(3);
+  });
+
+  it('GET /v1/sessions/:id/excerpt respects max_chars', async () => {
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    const testFile = path.join(workspace, 'test.txt');
+    fs.writeFileSync(testFile, 'abcdefghij\nklmnopqrst\n');
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/excerpt`)
+      .query({ path: 'test.txt', max_chars: 5 })
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(200);
+    expect(res.body.content.length).toBeLessThanOrEqual(5);
   });
 
   // --- GET /v1/sessions/:id/artifacts ---
@@ -271,6 +323,32 @@ describe('routes', () => {
     expect(res.status).toBe(404);
   });
 
+  it('GET /v1/sessions/:id/artifacts returns metadata array', async () => {
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/artifacts`)
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.artifacts)).toBe(true);
+    // Each entry is an ArtifactEntry object (not a plain string)
+    for (const a of res.body.artifacts) {
+      expect(typeof a).toBe('object');
+    }
+  });
+
   // --- GET /v1/sessions/:id/artifacts/:name ---
 
   it('GET /v1/sessions/:id/artifacts/:name returns 404 for unknown session', async () => {
@@ -279,6 +357,116 @@ describe('routes', () => {
       .set('Authorization', AUTH);
 
     expect(res.status).toBe(404);
+  });
+
+  // --- GET /v1/sessions/:id/logtail ---
+
+  it('GET /v1/sessions/:id/logtail returns 404 for unknown session', async () => {
+    const res = await request(app())
+      .get('/v1/sessions/nonexistent/logtail')
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(404);
+  });
+
+  it('GET /v1/sessions/:id/logtail returns 400 for invalid stream', async () => {
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/logtail`)
+      .query({ stream: 'invalid' })
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(400);
+  });
+
+  it('GET /v1/sessions/:id/logtail returns empty lines when no turn logs exist', async () => {
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    // StubWorker doesn't write turn logs, so logtail returns empty
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/logtail`)
+      .query({ stream: 'stdout', n: 10 })
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.lines)).toBe(true);
+    expect(res.body.stream).toBe('stdout');
+    expect(res.body.n).toBe(10);
+  });
+
+  it('GET /v1/sessions/:id/logtail reads turn logs and applies grep', async () => {
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    // Write a fake stdout.log directly so we can test reading
+    const turnDir = path.join(tmpDir, sessionId, 'turns', '0001');
+    fs.mkdirSync(turnDir, { recursive: true });
+    fs.writeFileSync(path.join(turnDir, 'stdout.log'), 'hello world\nerror here\nanother line\n');
+
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/logtail`)
+      .query({ stream: 'stdout', n: 50, grep: 'error' })
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(200);
+    expect(res.body.lines).toEqual(['error here']);
+  });
+
+  it('GET /v1/sessions/:id/logtail caps n at logtailMaxLines', async () => {
+    config.logtailMaxLines = 5;
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/logtail`)
+      .query({ stream: 'stdout', n: 9999 })
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(200);
+    expect(res.body.n).toBe(5);
   });
 
   // --- GET /v1/health ---
