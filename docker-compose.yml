@@ -7,12 +7,17 @@ services:
       - "127.0.0.1:8787:8787"
     environment:
       AF_PORT: "8787"
+      # IMPORTANT (Linux): set AF_BIND=0.0.0.0 so the agent container can reach
+      # the firewall. On macOS/Windows, Docker Desktop handles host routing
+      # automatically. On Linux, binding to 127.0.0.1 means the agent container
+      # cannot reach the firewall — see README for options.
       AF_BIND: "0.0.0.0"
       AF_BRIDGE_TOKEN: "${AF_BRIDGE_TOKEN}"
       AF_ALLOWED_ROOTS: "${AF_ALLOWED_ROOTS:-/workspace}"
       AF_DENY_GLOBS: "${AF_DENY_GLOBS:-**/.env,**/.ssh/**,**/credentials*,**/*.pem,**/*.key}"
       AF_DATA_DIR: "/data/sessions"
       AF_MAX_CONCURRENT: "1"
+      AF_LOGTAIL_MAX_LINES: "${AF_LOGTAIL_MAX_LINES:-200}"
       AF_PROMPT_APPEND: "${AF_PROMPT_APPEND:-}"
     volumes:
       - session-data:/data/sessions
@@ -22,12 +27,36 @@ services:
       - agent-net
     restart: unless-stopped
 
+  openclaw-agent:
+    # Replace with your actual agent image.
+    # This placeholder keeps the container alive so you can exec into it for testing.
+    image: curlimages/curl:latest
+    command: ["sh", "-c", "while true; do sleep 60; done"]
+    environment:
+      # The firewall URL reachable from inside the container.
+      # On Linux: host.docker.internal resolves via extra_hosts below.
+      # On macOS/Windows: Docker Desktop provides this automatically.
+      FIREWALL_URL: "http://host.docker.internal:8787"
+      FIREWALL_TOKEN: "${AF_BRIDGE_TOKEN}"
+    # Linux: map host.docker.internal → host gateway IP
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - agent-net
+    # Agent containers never mount /home, credentials, or the host repo.
+    # Add workspace volume mounts below if the agent needs read/write access:
+    # volumes:
+    #   - /path/to/your/project:/workspace
+    restart: unless-stopped
+    depends_on:
+      - agent-firewall
+
 volumes:
   session-data:
 
 networks:
   agent-net:
     driver: bridge
-    # Agents on this network cannot reach the host network.
-    # If agents need internet access for specific tools, add explicit
-    # egress rules in a firewall or use a proxy container.
+    # Agents on this network cannot reach the host network directly.
+    # The extra_hosts entry above provides the one explicit path: host.docker.internal.
+    # If agents need internet access, add an explicit egress allowlist or proxy.
