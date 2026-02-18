@@ -40,9 +40,9 @@ docker compose up --build
 **Docker (firewall + agent):**
 
 ```bash
-# Edit docker-compose.yml: replace openclaw-agent image with your agent image,
-# mount your workspace volume, then:
-docker compose up --build
+# Edit docker-compose.agent.yml: replace the openclaw-agent image with your
+# agent image, mount your workspace volume, then:
+docker compose -f docker-compose.yml -f docker-compose.agent.yml up --build
 ```
 
 The server listens on `127.0.0.1:8787` by default (locally) or `0.0.0.0:8787` in Docker.
@@ -120,9 +120,9 @@ curl -X POST -H "Authorization: Bearer $AF_BRIDGE_TOKEN" \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| stream | stdout | `stdout` or `stderr` |
-| n | 50 | Number of lines to return (capped at `AF_LOGTAIL_MAX_LINES`) |
-| grep | (empty) | Filter lines to those containing this string |
+| stream | stderr | `stdout` or `stderr` |
+| n | 200 | Number of lines to return (capped at `AF_LOGTAIL_MAX_LINES`) |
+| grep | (empty) | Filter lines containing this literal substring |
 
 Returns: `{ lines: string[], stream: string, n: number }` — all lines are redacted.
 
@@ -134,7 +134,7 @@ Supports two naming conventions (backward-compatible):
 |-----------|-------|---------|-------------|
 | line_start | start | 1 | First line (1-indexed) |
 | line_end | end | (EOF) | Last line (inclusive) |
-| max_chars | - | 0 (unlimited) | Truncate output at N characters |
+| max_chars | - | `AF_EXCERPT_MAX_CHARS` | Truncate output at N characters (capped at config) |
 
 ### GET /v1/sessions/:id/artifacts response
 
@@ -175,35 +175,53 @@ out/
 | AF_DENY_GLOBS | no | **/.env,**/.ssh/**,**/credentials*,**/*.pem,**/*.key | Glob patterns always denied |
 | AF_DATA_DIR | no | ./data/sessions | Session persistence directory |
 | AF_MAX_CONCURRENT | no | 1 | Max concurrent sessions |
-| AF_LOGTAIL_MAX_LINES | no | 200 | Maximum lines returnable from logtail |
+| AF_LOGTAIL_MAX_LINES | no | 2000 | Maximum lines returnable from logtail (hard cap: 10,000) |
+| AF_EXCERPT_MAX_CHARS | no | 100000 | Maximum chars returnable from excerpt (hard cap: 1,000,000) |
 | AF_PROMPT_APPEND | no | (empty) | Extra instructions appended to agent prompt |
 
-## Docker Compose — Two-Service Setup
+## Docker Compose
 
-The `docker-compose.yml` defines two services:
+`docker-compose.yml` starts only the **agent-firewall** service. A separate `docker-compose.agent.yml` adds the optional agent sidecar.
 
-1. **agent-firewall** — the HTTP API (this repo)
-2. **openclaw-agent** — placeholder for your agent container
+**Firewall only:**
+```bash
+docker compose up --build
+```
+
+**Firewall + agent sidecar:**
+```bash
+docker compose -f docker-compose.yml -f docker-compose.agent.yml up --build
+```
+
+Edit `docker-compose.agent.yml` to replace the placeholder image with your actual agent image and mount your workspace volume.
 
 ### How the agent reaches the firewall
 
-The firewall binds to `0.0.0.0:8787` inside Docker and is published on `127.0.0.1:8787` on the host. The agent container uses `host.docker.internal:8787` to reach the firewall via the bridge network.
+The firewall binds to `0.0.0.0:8787` inside Docker and is published on `127.0.0.1:8787` on the host. The agent container uses `http://host.docker.internal:8787` to reach the firewall.
 
 ### Linux bind caveat
 
-On **Linux**, Docker Desktop is not typically used, so `host.docker.internal` doesn't resolve automatically. The compose file includes:
+On **Linux**, `host.docker.internal` doesn't resolve automatically (no Docker Desktop). The `docker-compose.agent.yml` includes:
 
 ```yaml
 extra_hosts:
   - "host.docker.internal:host-gateway"
 ```
 
-This maps `host.docker.internal` to the Docker bridge gateway IP, which works if the firewall's `AF_BIND` is `0.0.0.0` (default in compose). **Do not set `AF_BIND=127.0.0.1` on Linux in Docker** — the agent container cannot reach a loopback-bound service on the host.
+This maps `host.docker.internal` to the Docker bridge gateway IP. **Do not set `AF_BIND=127.0.0.1` on Linux in Docker** — the agent container cannot reach a loopback-bound service on the host.
 
-Alternatives if you can't set `AF_BIND=0.0.0.0`:
-- Use `iptables` to forward the port: `iptables -t nat -A PREROUTING -p tcp --dport 8787 -j REDIRECT`
-- Use a firewalld/ufw rule to allow the docker0 interface
-- Or bind the firewall to the docker0 IP directly: `AF_BIND=172.17.0.1`
+If the firewall runs on the **host** (not in Docker) and you need to restrict access to only the Docker bridge, use `ufw`:
+
+```bash
+# Allow Docker bridge (172.17.0.0/16) to reach the firewall on port 8787
+sudo ufw allow in on docker0 to any port 8787
+# Deny all other incoming connections to 8787
+sudo ufw deny 8787
+```
+
+Other options if you can't use `AF_BIND=0.0.0.0`:
+- Bind to the docker0 IP directly: `AF_BIND=172.17.0.1`
+- Use `iptables`: `iptables -t nat -A PREROUTING -i docker0 -p tcp --dport 8787 -j ACCEPT`
 
 ## Security Notes
 

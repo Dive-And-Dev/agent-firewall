@@ -59,17 +59,6 @@ export function validateTaskInput(input: any, config: Config): ValidationResult 
 
   if (!input || typeof input.workspace_root !== 'string' || !input.workspace_root.trim()) {
     errors.push('workspace_root is required');
-  } else {
-    const resolvedWorkspace = resolveRealPath(input.workspace_root.trim());
-    const underAllowedRoot = config.allowedRoots.some(root => {
-      const resolvedRoot = resolveRealPath(root);
-      if (resolvedWorkspace === resolvedRoot) return true;
-      const prefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
-      return resolvedWorkspace.startsWith(prefix);
-    });
-    if (!underAllowedRoot) {
-      errors.push('workspace_root is not under any allowed root');
-    }
   }
 
   if (errors.length > 0) {

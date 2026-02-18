@@ -64,6 +64,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     timeoutSecondsCap: 1800,
     promptAppendMaxBytes: 2048,
     logtailMaxLines: 200,
+    excerptMaxChars: 100000,
     ...overrides,
   };
 }
@@ -126,7 +127,7 @@ describe('routes', () => {
     expect(res.body.errors).toContain('goal is required');
   });
 
-  it('POST /v1/tasks rejects workspace outside allowed roots', async () => {
+  it('POST /v1/tasks rejects workspace outside allowed roots with 403', async () => {
     config.allowedRoots = ['/tmp/allowed-only'];
 
     const res = await request(app())
@@ -134,7 +135,7 @@ describe('routes', () => {
       .set('Authorization', AUTH)
       .send({ goal: 'Fix', workspace_root: '/home/evil' });
 
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
   });
 
   it('POST /v1/tasks returns 503 when slot is busy', async () => {
@@ -445,6 +446,36 @@ describe('routes', () => {
     expect(res.body.lines).toEqual(['error here']);
   });
 
+  it('GET /v1/sessions/:id/logtail grep is literal substring (not regex)', async () => {
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    // Write a log with a special-regex-character in a line
+    const turnDir = path.join(tmpDir, sessionId, 'turns', '0001');
+    fs.mkdirSync(turnDir, { recursive: true });
+    fs.writeFileSync(path.join(turnDir, 'stdout.log'), 'hello [world]\nno match\n');
+
+    // grep '[world]' should be treated as literal (not a regex character class)
+    // so it matches the line containing literally '[world]'
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/logtail`)
+      .query({ stream: 'stdout', grep: '[world]' })
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(200);
+    expect(res.body.lines).toEqual(['hello [world]']);
+  });
+
   it('GET /v1/sessions/:id/logtail caps n at logtailMaxLines', async () => {
     config.logtailMaxLines = 5;
     const workspace = path.join(tmpDir, 'proj');
@@ -467,6 +498,64 @@ describe('routes', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.n).toBe(5);
+  });
+
+  // --- Symlink escape via excerpt ---
+
+  it('GET /v1/sessions/:id/excerpt blocks symlink escaping workspace root', async () => {
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    // Create a file outside the workspace and a symlink to it inside the workspace
+    const secretFile = path.join(tmpDir, 'secret.txt');
+    fs.writeFileSync(secretFile, 'should not be readable');
+    const symlinkPath = path.join(workspace, 'evil-link.txt');
+    fs.symlinkSync(secretFile, symlinkPath);
+
+    // Now restrict allowedRoots to only the workspace (not tmpDir)
+    config.allowedRoots = [workspace];
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/excerpt`)
+      .query({ path: 'evil-link.txt' })
+      .set('Authorization', AUTH);
+
+    // The symlink target is outside the allowed root — pathGuard must block it
+    expect(res.status).toBe(403);
+  });
+
+  // --- Artifact allowlist ---
+
+  it('GET /v1/sessions/:id/artifacts/:name returns 404 for name not in allowlist', async () => {
+    const workspace = path.join(tmpDir, 'proj');
+    fs.mkdirSync(workspace, { recursive: true });
+    config.allowedRoots = [tmpDir];
+
+    const appInstance = app();
+    const createRes = await request(appInstance)
+      .post('/v1/tasks')
+      .set('Authorization', AUTH)
+      .send({ goal: 'Test', workspace_root: workspace });
+
+    await worker.done;
+    const sessionId = createRes.body.session_id;
+
+    // StubWorker returns no artifacts, so any name lookup should return 404
+    const res = await request(appInstance)
+      .get(`/v1/sessions/${sessionId}/artifacts/not-in-list.txt`)
+      .set('Authorization', AUTH);
+
+    expect(res.status).toBe(404);
   });
 
   // --- GET /v1/health ---

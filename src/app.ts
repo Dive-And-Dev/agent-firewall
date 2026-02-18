@@ -35,7 +35,8 @@ export function createApp(config: Config, worker: Worker) {
 
     const pathCheck = validatePath(sanitized.workspace_root, config.allowedRoots, config.denyGlobs);
     if (!pathCheck.allowed) {
-      res.status(400).json({ error: 'workspace_root denied', reason: pathCheck.reason });
+      // 403: input is structurally valid, but policy forbids this path
+      res.status(403).json({ error: 'workspace_root denied', reason: pathCheck.reason });
       return;
     }
 
@@ -155,13 +156,17 @@ export function createApp(config: Config, worker: Worker) {
       const lineEnd = parseInt(
         ((req.query.line_end ?? req.query.end) as string) || '0'
       ) || 0;
-      const maxChars = parseInt((req.query.max_chars as string) || '0') || 0;
+      // Caller may request a char limit; always cap at config.excerptMaxChars (policy)
+      const requestedMax = parseInt((req.query.max_chars as string) || '0') || 0;
+      const maxChars = requestedMax > 0
+        ? Math.min(requestedMax, config.excerptMaxChars)
+        : config.excerptMaxChars;
 
       const lines = content.split('\n');
       const start = Math.max(1, lineStart) - 1;
       const end = lineEnd > 0 ? Math.min(lineEnd, lines.length) : lines.length;
       let excerpt = lines.slice(start, end).join('\n');
-      if (maxChars > 0 && excerpt.length > maxChars) {
+      if (excerpt.length > maxChars) {
         excerpt = excerpt.slice(0, maxChars);
       }
 
@@ -229,15 +234,21 @@ export function createApp(config: Config, worker: Worker) {
       return;
     }
 
-    const stream = (req.query.stream as string) || 'stdout';
+    const stream = (req.query.stream as string) || 'stderr';
     if (stream !== 'stdout' && stream !== 'stderr') {
       res.status(400).json({ error: 'stream must be stdout or stderr' });
       return;
     }
 
-    const nRaw = parseInt((req.query.n as string) || '50') || 50;
+    const nRaw = parseInt((req.query.n as string) || '200') || 200;
     const n = Math.min(Math.max(1, nRaw), config.logtailMaxLines);
-    const grep = (req.query.grep as string) || '';
+    const grepRaw = (req.query.grep as string) || '';
+
+    // grep is a literal substring filter (not regex) — using regex would expose
+    // a ReDoS vector because no heuristic can reliably block all catastrophic
+    // backtracking patterns. Literal matching is safe, O(n), and sufficient for
+    // the expected use case of finding keywords in log lines.
+    const grep = grepRaw;
 
     const sessionDir = path.join(config.dataDir, req.params.id);
     const logFile = await findLatestTurnLog(sessionDir, stream);

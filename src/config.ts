@@ -11,6 +11,7 @@ export interface Config {
   timeoutSecondsCap: number;
   promptAppendMaxBytes: number;
   logtailMaxLines: number;
+  excerptMaxChars: number;
 }
 
 export function loadConfig(): Config {
@@ -48,8 +49,12 @@ export function loadConfig(): Config {
     timeoutSecondsCap: 1800,
     promptAppendMaxBytes: 2048,
     logtailMaxLines: Math.min(
-      Math.max(1, parseInt(process.env.AF_LOGTAIL_MAX_LINES || '200', 10) || 200),
+      Math.max(1, parseInt(process.env.AF_LOGTAIL_MAX_LINES || '2000', 10) || 2000),
       10_000,
+    ),
+    excerptMaxChars: Math.min(
+      Math.max(1, parseInt(process.env.AF_EXCERPT_MAX_CHARS || '100000', 10) || 100000),
+      1_000_000,
     ),
   };
 }

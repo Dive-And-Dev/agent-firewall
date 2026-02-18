@@ -128,19 +128,19 @@ else
   echo "  ⏭  Skipping Test 3 (no session_id)"
 fi
 
-# ── Test 4: workspace_root = bad path → 400 ────────────────────────────────
+# ── Test 4: workspace_root = bad path → 403 ────────────────────────────────
 echo ""
-echo "Test 4: workspace_root outside allowed roots → 400"
+echo "Test 4: workspace_root outside allowed roots → 403"
 
 DENY_STATUS=$(http_status -X POST "$BASE_URL/v1/tasks" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"goal":"Evil","workspace_root":"/etc"}')
 
-if [[ "$DENY_STATUS" == "400" ]]; then
-  pass "workspace_root=/etc → 400 (denied)"
+if [[ "$DENY_STATUS" == "403" ]]; then
+  pass "workspace_root=/etc → 403 (denied)"
 else
-  fail "workspace_root=/etc → $DENY_STATUS (expected 400)"
+  fail "workspace_root=/etc → $DENY_STATUS (expected 403)"
 fi
 
 # ── Test 5: No Authorization header → 401 ─────────────────────────────────
