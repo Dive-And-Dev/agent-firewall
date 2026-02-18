@@ -27,29 +27,6 @@ services:
       - agent-net
     restart: unless-stopped
 
-  openclaw-agent:
-    # Replace with your actual agent image.
-    # This placeholder keeps the container alive so you can exec into it for testing.
-    image: curlimages/curl:latest
-    command: ["sh", "-c", "while true; do sleep 60; done"]
-    environment:
-      # The firewall URL reachable from inside the container.
-      # On Linux: host.docker.internal resolves via extra_hosts below.
-      # On macOS/Windows: Docker Desktop provides this automatically.
-      FIREWALL_URL: "http://host.docker.internal:8787"
-      FIREWALL_TOKEN: "${AF_BRIDGE_TOKEN}"
-    # Linux: map host.docker.internal → host gateway IP
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - agent-net
-    # Agent containers never mount /home, credentials, or the host repo.
-    # Add workspace volume mounts below if the agent needs read/write access:
-    # volumes:
-    #   - /path/to/your/project:/workspace
-    restart: unless-stopped
-    depends_on:
-      - agent-firewall
 
 volumes:
   session-data:

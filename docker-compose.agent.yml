@@ -1,0 +1,35 @@
+# Optional agent sidecar — bring up alongside docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.agent.yml up -d
+#
+# Replace the image and command below with your actual agent image.
+# The placeholder keeps the container alive for manual testing / exec.
+
+version: '3.9'
+
+services:
+  openclaw-agent:
+    image: curlimages/curl:latest
+    command: ["sh", "-c", "while true; do sleep 60; done"]
+    environment:
+      # The firewall URL reachable from inside the container.
+      # On Linux: host.docker.internal resolves via extra_hosts below.
+      # On macOS/Windows: Docker Desktop provides this automatically.
+      FIREWALL_URL: "http://host.docker.internal:8787"
+      FIREWALL_TOKEN: "${AF_BRIDGE_TOKEN}"
+    # Linux: map host.docker.internal → host gateway IP
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - agent-net
+    # Agent containers never mount /home, credentials, or the host repo.
+    # Add workspace volume mounts below if the agent needs read/write access:
+    # volumes:
+    #   - /path/to/your/project:/workspace
+    restart: unless-stopped
+    depends_on:
+      - agent-firewall
+
+# Networks are inherited from docker-compose.yml when run with:
+#   docker compose -f docker-compose.yml -f docker-compose.agent.yml up
+# Do not redeclare agent-net here to avoid conflicts with the base definition.
