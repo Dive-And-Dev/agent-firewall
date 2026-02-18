@@ -7,6 +7,7 @@ const baseConfig: Config = {
   dataDir: './data/sessions', allowedRoots: ['/tmp/allowed'],
   denyGlobs: ['**/.env'], promptAppend: '', maxConcurrent: 1,
   turnsMaxCap: 50, timeoutSecondsCap: 1800, promptAppendMaxBytes: 2048,
+  logtailMaxLines: 2000, excerptMaxChars: 100000,
 };
 
 describe('validateTaskInput', () => {
@@ -28,11 +29,8 @@ describe('validateTaskInput', () => {
     expect(result.valid).toBe(false);
   });
 
-  it('rejects workspace_root outside allowed roots', () => {
-    const result = validateTaskInput({ goal: 'Fix', workspace_root: '/tmp/unauthorized' }, baseConfig);
-    expect(result.valid).toBe(false);
-    expect(result.errors).toContain('workspace_root is not under any allowed root');
-  });
+  // Note: allowed-root policy enforcement (→ 403) is handled by validatePath in app.ts,
+  // not by validateTaskInput. validateTaskInput only validates input structure.
 
   it('caps turns_max at 50', () => {
     const result = validateTaskInput({ goal: 'Fix', workspace_root: '/tmp/allowed/proj', turns_max: 100 }, baseConfig);
