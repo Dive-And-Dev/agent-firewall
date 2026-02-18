@@ -13,6 +13,13 @@ export interface ArtifactEntry {
   sha256: string;
 }
 
+export interface FallbackEvent {
+  time: string;
+  attempted_flag: string;
+  reason: string;
+  fallback_action: string;
+}
+
 export interface SharedState {
   session_id: string;
   goal: string;
@@ -22,8 +29,9 @@ export interface SharedState {
   progress: string[];
   blockers: Blocker[];
   files_changed: string[];
-  artifacts: string[];
-  fallback_events: string[];
+  artifacts: ArtifactEntry[];
+  fallback_events: FallbackEvent[];
+  cost_usd: number | null;
   updated_at: string;
   error_summary: string | null;
 }

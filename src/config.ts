@@ -10,6 +10,7 @@ export interface Config {
   turnsMaxCap: number;
   timeoutSecondsCap: number;
   promptAppendMaxBytes: number;
+  logtailMaxLines: number;
 }
 
 export function loadConfig(): Config {
@@ -46,5 +47,9 @@ export function loadConfig(): Config {
     turnsMaxCap: 50,
     timeoutSecondsCap: 1800,
     promptAppendMaxBytes: 2048,
+    logtailMaxLines: Math.min(
+      Math.max(1, parseInt(process.env.AF_LOGTAIL_MAX_LINES || '200', 10) || 200),
+      10_000,
+    ),
   };
 }

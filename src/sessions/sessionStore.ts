@@ -54,6 +54,7 @@ export class FileSessionStore {
       files_changed: [],
       artifacts: [],
       fallback_events: [],
+      cost_usd: null,
       updated_at: new Date().toISOString(),
       error_summary: null,
     };
