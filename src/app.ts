@@ -1,5 +1,5 @@
 import express from 'express';
-import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
 import type { Config } from './config.js';
@@ -25,7 +25,6 @@ export function createApp(config: Config, worker: Worker) {
 
   // --- POST /v1/tasks ---
   app.post('/v1/tasks', async (req, res) => {
-    // Validate input
     const validation = validateTaskInput(req.body, config);
     if (!validation.valid) {
       res.status(400).json({ error: 'Invalid task input', errors: validation.errors });
@@ -34,14 +33,13 @@ export function createApp(config: Config, worker: Worker) {
 
     const sanitized = validation.sanitized!;
 
-    // Check workspace_root against pathGuard
     const pathCheck = validatePath(sanitized.workspace_root, config.allowedRoots, config.denyGlobs);
     if (!pathCheck.allowed) {
       res.status(400).json({ error: 'workspace_root denied', reason: pathCheck.reason });
       return;
     }
 
-    // Build prompt before acquiring gate — buildPrompt can throw and must not hold the lock
+    // Build prompt before acquiring gate — buildPrompt can throw
     const constraints = sanitized.allowed_tools.length > 0
       ? `ALLOWED_TOOLS: ${sanitized.allowed_tools.join(', ')}`
       : '';
@@ -51,7 +49,6 @@ export function createApp(config: Config, worker: Worker) {
       config.promptAppend,
     );
 
-    // Try to acquire concurrency slot (after all synchronous validation)
     const sessionId = uuidv4();
     if (!gate.acquire(sanitized.workspace_root, sessionId)) {
       res.status(503).json({
@@ -61,7 +58,6 @@ export function createApp(config: Config, worker: Worker) {
       return;
     }
 
-    // Create session record — release gate on any setup failure
     try {
       await store.create(sessionId, {
         session_id: sessionId,
@@ -78,15 +74,11 @@ export function createApp(config: Config, worker: Worker) {
       throw err;
     }
 
-    // Return 202 immediately
     res.status(202).json({ session_id: sessionId });
 
-    // Run worker in background (fire-and-forget)
     const ac = new AbortController();
     abortControllers.set(sessionId, ac);
-
-    // Fire-and-forget: suppress unhandled rejections — runWorker handles all errors internally
-    runWorker(sessionId, sanitized, prompt, worker, store, gate, ac, abortControllers).catch(() => {});
+    runWorker(sessionId, sanitized, prompt, config, worker, store, gate, ac, abortControllers).catch(() => {});
   });
 
   // --- GET /v1/sessions ---
@@ -120,13 +112,10 @@ export function createApp(config: Config, worker: Worker) {
 
     const ac = abortControllers.get(req.params.id);
     if (ac) {
-      // Signal the worker to stop. runWorker's finally block releases the gate
-      // when the worker actually exits — we must NOT release it here to avoid
-      // a race where a new session starts before the old worker terminates.
+      // Signal the worker; runWorker's finally block releases the gate
       ac.abort();
     }
 
-    // Mark as aborted immediately so callers can see the state
     await store.updateState(req.params.id, {
       status: 'aborted',
       error_summary: 'Aborted by client request',
@@ -149,10 +138,7 @@ export function createApp(config: Config, worker: Worker) {
       return;
     }
 
-    // Resolve file path relative to the session's workspace
     const resolved = path.resolve(task.workspace_root, filePath);
-
-    // PathGuard: scope to session's workspace_root (not global allowedRoots)
     const pathCheck = validatePath(resolved, [task.workspace_root], config.denyGlobs);
     if (!pathCheck.allowed) {
       res.status(403).json({ error: 'Path access denied', reason: pathCheck.reason });
@@ -160,14 +146,24 @@ export function createApp(config: Config, worker: Worker) {
     }
 
     try {
-      const content = fs.readFileSync(pathCheck.resolved!, 'utf-8');
-      const lineStart = parseInt(req.query.line_start as string) || 1;
-      const lineEnd = parseInt(req.query.line_end as string) || 0;
+      const content = await fsp.readFile(pathCheck.resolved!, 'utf-8');
+
+      // Support both line_start/line_end (original) and start/end (spec alias)
+      const lineStart = parseInt(
+        ((req.query.line_start ?? req.query.start) as string) || '1'
+      ) || 1;
+      const lineEnd = parseInt(
+        ((req.query.line_end ?? req.query.end) as string) || '0'
+      ) || 0;
+      const maxChars = parseInt((req.query.max_chars as string) || '0') || 0;
 
       const lines = content.split('\n');
       const start = Math.max(1, lineStart) - 1;
       const end = lineEnd > 0 ? Math.min(lineEnd, lines.length) : lines.length;
-      const excerpt = lines.slice(start, end).join('\n');
+      let excerpt = lines.slice(start, end).join('\n');
+      if (maxChars > 0 && excerpt.length > maxChars) {
+        excerpt = excerpt.slice(0, maxChars);
+      }
 
       res.json({ path: filePath, line_start: start + 1, line_end: end, content: redact(excerpt) });
     } catch (err: any) {
@@ -186,6 +182,7 @@ export function createApp(config: Config, worker: Worker) {
       res.status(404).json({ error: 'Session not found' });
       return;
     }
+    // Return full ArtifactEntry metadata (name, path, bytes, sha256)
     res.json({ artifacts: state.artifacts });
   });
 
@@ -200,13 +197,17 @@ export function createApp(config: Config, worker: Worker) {
       return;
     }
 
-    // Allowlist check: only serve artifacts recorded in session state
-    if (!state.artifacts.includes(req.params.name)) {
+    // Allowlist check: only serve artifacts recorded in session state.
+    // Handle both ArtifactEntry[] (current format) and legacy string[] (pre-migration sessions).
+    const name = req.params.name;
+    const allowed = state.artifacts.some(
+      a => (typeof a === 'string' ? a : (a as { name: string }).name) === name,
+    );
+    if (!allowed) {
       res.status(404).json({ error: 'Artifact not found' });
       return;
     }
 
-    // getArtifactPath validates the name and prevents traversal
     const artifactPath = await store.getArtifactPath(
       req.params.id,
       req.params.name,
@@ -220,6 +221,41 @@ export function createApp(config: Config, worker: Worker) {
     res.sendFile(artifactPath);
   });
 
+  // --- GET /v1/sessions/:id/logtail ---
+  app.get('/v1/sessions/:id/logtail', async (req, res) => {
+    const state = await store.getState(req.params.id);
+    if (!state) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const stream = (req.query.stream as string) || 'stdout';
+    if (stream !== 'stdout' && stream !== 'stderr') {
+      res.status(400).json({ error: 'stream must be stdout or stderr' });
+      return;
+    }
+
+    const nRaw = parseInt((req.query.n as string) || '50') || 50;
+    const n = Math.min(Math.max(1, nRaw), config.logtailMaxLines);
+    const grep = (req.query.grep as string) || '';
+
+    const sessionDir = path.join(config.dataDir, req.params.id);
+    const logFile = await findLatestTurnLog(sessionDir, stream);
+
+    if (!logFile) {
+      res.json({ lines: [], stream, n });
+      return;
+    }
+
+    try {
+      let lines = await tailLines(logFile, n);
+      if (grep) lines = lines.filter(l => l.includes(grep));
+      res.json({ lines: lines.map(l => redact(l)), stream, n });
+    } catch {
+      res.json({ lines: [], stream, n });
+    }
+  });
+
   // --- GET /v1/health ---
   app.get('/v1/health', (_req, res) => {
     res.json({
@@ -231,22 +267,70 @@ export function createApp(config: Config, worker: Worker) {
   return app;
 }
 
+// Read the last `maxLines` lines from a file without loading the entire contents.
+// Estimates ~512 bytes per line, which comfortably covers typical log lines.
+async function tailLines(filePath: string, maxLines: number): Promise<string[]> {
+  const BYTES_PER_LINE = 512;
+  const stat = await fsp.stat(filePath);
+  if (stat.size === 0) return [];
+
+  const readBytes = Math.min(stat.size, maxLines * BYTES_PER_LINE + 512);
+  const offset = stat.size - readBytes;
+
+  const fh = await fsp.open(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(readBytes);
+    const { bytesRead } = await fh.read(buf, 0, readBytes, offset);
+    let lines = buf.slice(0, bytesRead).toString('utf-8').split('\n');
+    // Drop the first entry when starting mid-file — it may be a partial line
+    if (offset > 0 && lines.length > 0) lines = lines.slice(1);
+    return lines.filter(l => l.length > 0).slice(-maxLines);
+  } finally {
+    await fh.close();
+  }
+}
+
+async function findLatestTurnLog(sessionDir: string, stream: string): Promise<string | null> {
+  const turnsDir = path.join(sessionDir, 'turns');
+  try {
+    const entries = await fsp.readdir(turnsDir);
+    entries.sort();
+    const latest = entries[entries.length - 1];
+    if (!latest) return null;
+    const logFile = path.join(turnsDir, latest, `${stream}.log`);
+    await fsp.access(logFile);
+    return logFile;
+  } catch {
+    return null;
+  }
+}
+
 async function runWorker(
   sessionId: string,
-  sanitized: { goal: string; workspace_root: string; turns_max: number; timeout_seconds: number },
+  sanitized: {
+    goal: string;
+    workspace_root: string;
+    turns_max: number;
+    timeout_seconds: number;
+    allowed_tools: string[];
+  },
   prompt: string,
+  config: Config,
   worker: Worker,
   store: FileSessionStore,
   gate: GlobalConcurrencyGate,
   ac: AbortController,
   abortControllers: Map<string, AbortController>,
 ): Promise<void> {
+  const sessionDir = path.join(config.dataDir, sessionId);
   try {
     const result = await worker.run(
       sessionId,
       sanitized.goal,
       prompt,
       sanitized.workspace_root,
+      sessionDir,
+      sanitized.allowed_tools,
       sanitized.timeout_seconds * 1000,
       async (patch) => {
         if (ac.signal.aborted) return;
@@ -266,7 +350,9 @@ async function runWorker(
     await store.updateState(sessionId, {
       status,
       files_changed: result.files_changed,
-      artifacts: result.artifacts.map(a => a.name),
+      artifacts: result.artifacts,
+      fallback_events: result.fallback_events,
+      cost_usd: result.cost_usd,
       blockers: result.blockers,
       error_summary: errorSummary,
     });
